@@ -54,14 +54,8 @@ namespace {
 
 template<typename FloatType>
 Status setup_spreader(int rank,
-                      int kerevalmeth, bool show_warnings,
                       const InternalOptions& options,
                       SpreadParameters<FloatType> &spread_params);
-
-template<typename FloatType>
-Status setup_spreader_for_nufft(int rank,
-                                const InternalOptions& options,
-                                SpreadParameters<FloatType> &spread_params);
 
 static int get_transform_rank(int64_t n1, int64_t n2, int64_t n3);
 
@@ -205,19 +199,15 @@ Status Plan<CPUDevice, FloatType>::initialize(
   this->rank_ = rank;
   this->type_ = type;
   this->fft_direction_ = fft_direction;
-  this->tol_ = std::max(tol, kEpsilon<FloatType>);
   this->num_transforms_ = num_transforms;
+  this->tol_ = std::max(tol, kEpsilon<FloatType>);
   this->options_ = options;
 
   this->grid_dims_[0] = grid_dims[0];
   this->grid_dims_[1] = (this->rank_ > 1) ? grid_dims[1] : 1;
   this->grid_dims_[2] = (this->rank_ > 2) ? grid_dims[2] : 1;
-  this->grid_size_ = this->grid_dims_[0] * this->grid_dims_[1] * this->grid_dims_[2];
-
-  // Choose kernel evaluation method.
-  if (this->options_.kernel_evaluation_method == KernelEvaluationMethod::AUTO) {
-    this->options_.kernel_evaluation_method = KernelEvaluationMethod::HORNER;
-  }
+  this->grid_size_ = this->grid_dims_[0] * this->grid_dims_[1] *
+                     this->grid_dims_[2];
 
   // Choose overall number of threads.
   int num_threads = OMP_GET_MAX_THREADS();
@@ -247,7 +237,7 @@ Status Plan<CPUDevice, FloatType>::initialize(
     this->options_.spread_threading = SpreadThreading::PARALLEL_SINGLE_THREADED;
 
   // Populate the spreader options.
-  TF_RETURN_IF_ERROR(setup_spreader_for_nufft(
+  TF_RETURN_IF_ERROR(setup_spreader(
       rank, this->options_, this->spread_params_));
 
   // Initialize pointers to null.
@@ -384,6 +374,50 @@ Status Plan<CPUDevice, FloatType>::interp(DType* c, DType* f) {
 template<typename FloatType>
 Status Plan<CPUDevice, FloatType>::spread(DType* c, DType* f) {
   return this->spread_or_interp(c, f);
+}
+
+template<typename FloatType>
+double Plan<CPUDevice, FloatType>::default_upsampling_factor() const {
+  // In general, the upsampling factor is 2.0.
+  double upsampling_factor = 2.0;
+  // In certain circumstances, an upsampling factor of 1.25 is enough.
+  if (this->tol_ >= 1e-9) {
+    if ((this->rank_ == 1 && this->grid_size_ > 10000000) ||
+        (this->rank_ == 2 && this->grid_size_ > 300000) ||
+        (this->rank_ == 3 && this->grid_size_ > 3000000))
+      upsampling_factor = 1.25;
+  }
+  return upsampling_factor;
+}
+
+template<typename FloatType>
+KernelEvalAlgo Plan<CPUDevice, FloatType>::default_kernel_eval_algo() const {
+  if (this->options_.upsampling_factor == 2.0 ||
+      this->options_.upsampling_factor == 1.25) {
+    // Horner is faster but only implemented if upsampling factor is 2.0 or
+    // 1.25.
+    return KernelEvalAlgo::HORNER;
+  }
+  return KernelEvalAlgo::DIRECT;
+}
+
+template<typename FloatType>
+Status Plan<CPUDevice, FloatType>::check_kernel_eval_algo(
+    KernelEvalAlgo kernel_eval_algo) const {
+  if (kernel_eval_algo == KernelEvalAlgo::HORNER &&
+      this->options_.upsampling_factor != 2.0 &&
+      this->options_.upsampling_factor != 1.25) {
+    return errors::Unimplemented(
+        "Horner kernel evaluation algorithm is only implemented for "
+        "upsampling factor equal to 2.0 or 1.25 (CPU).");
+  }
+  return OkStatus();
+}
+
+template<typename FloatType>
+int Plan<CPUDevice, FloatType>::validate_fine_grid_dimension(
+    int idx, int dim) const {
+  return next_smooth_integer(dim);
 }
 
 template<typename FloatType>
@@ -689,7 +723,6 @@ namespace {
 template<typename FloatType>
 Status setup_spreader(
     int rank,
-    int kerevalmeth, bool show_warnings,
     const InternalOptions& options,
     SpreadParameters<FloatType> &spread_params)
 /* Initializes spreader kernel parameters given desired NUFFT tol eps,
@@ -702,20 +735,15 @@ Status setup_spreader(
    Barnett 2017. debug, loosened eps logic 6/14/20.
 */
 {
-  if (options.upsampling_factor != 2.0 && options.upsampling_factor != 1.25) {
-    if (kerevalmeth == 1) {
-      return errors::Internal(
-          "Horner kernel evaluation only supports standard "
-          "upsampling factors of 2.0 or 1.25, but got ",
-          options.upsampling_factor);
-    }
-  }
+  spread_params.spread_only = options.spread_only;
+
+  bool show_warnings = options.show_warnings;
 
   // write out default SpreadParameters<FloatType>
   spread_params.pirange = 1;             // user also should always set this
   spread_params.sort_points = SortPoints::AUTO;
   spread_params.pad_kernel = 0;              // affects only evaluate_kernel_vector
-  spread_params.kerevalmeth = kerevalmeth;
+  spread_params.kerevalmeth = static_cast<int>(options.kernel_eval_algo) - 1;;
   spread_params.upsampling_factor = options.upsampling_factor;
   spread_params.num_threads = 0;            // all avail
   spread_params.sort_threads = 0;        // 0:auto-choice
@@ -746,24 +774,6 @@ Status setup_spreader(
   // Calculate scaling factor for spread/interp only mode.
   if (spread_params.spread_only)
     spread_params.kernel_scale = calculate_scale_factor<FloatType>(rank, spread_params);
-
-  return OkStatus();
-}
-
-template<typename FloatType>
-Status setup_spreader_for_nufft(int rank,
-                                const InternalOptions& options,
-                                SpreadParameters<FloatType> &spread_params)
-// Set up the spreader parameters given eps, and pass across various nufft
-// options. Return status of setup_spreader. Uses pass-by-ref. Barnett 10/30/17
-{
-  // This must be set before calling setup_spreader
-  spread_params.spread_only = options.spread_only;
-
-  TF_RETURN_IF_ERROR(setup_spreader(
-      rank,
-      static_cast<int>(options.kernel_evaluation_method) - 1, // We subtract 1 temporarily, as spreader expects values of 0 or 1 instead of 1 and 2.
-      options.show_warnings, options, spread_params));
 
   // override various spread spread_params from their defaults...
   spread_params.sort_points = options.sort_points;

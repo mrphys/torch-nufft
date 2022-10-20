@@ -48,7 +48,7 @@ enum class ModeOrder {
   FFT = 1    // FFT-style mode order.
 };
 
-enum class KernelEvaluationMethod {
+enum class KernelEvalAlgo {
   AUTO = 0,    // Select automatically.
   DIRECT = 1,  // Direct evaluation of kernel.
   HORNER = 2   // Evaluate using Horner piecewise polynomial. Faster.
@@ -112,8 +112,7 @@ class InternalOptions : public Options {
 
   // The kernel evaluation method. See enum above. Applies to the CPU and the
   // GPU kernels.
-  KernelEvaluationMethod kernel_evaluation_method = \
-      KernelEvaluationMethod::AUTO;
+  KernelEvalAlgo kernel_eval_algo = KernelEvalAlgo::AUTO;
 
   // Whether to pad the interpolation kernel to a multiple of 4. This helps SIMD
   // when using direct kernel evaluation. Applies only to the CPU kernel.

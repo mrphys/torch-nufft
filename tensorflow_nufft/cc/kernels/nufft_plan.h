@@ -263,11 +263,24 @@ class PlanBase {
   // this->options_ is valid after calling this function.
   Status set_default_options();
 
+  // Returns the default upsampling factor.
+  virtual double default_upsampling_factor() const = 0;
+
+  // Returns the default kernel evaluation algorithm.
+  virtual KernelEvalAlgo default_kernel_eval_algo() const = 0;
+
+  // Checks that the kernel evaluation algorithm is valid.
+  virtual Status check_kernel_eval_algo(KernelEvalAlgo algo) const = 0;
+
   // Initializes the fine grid dimension sizes and allocates the array.
   // Sets: fine_dims_, fine_size_, fine_tensor_, fine_data_ and
   //   options_.upsampling_factor.
   // Requires: rank_, tol_, grid_dims_, grid_size_ and batch_size_.
   Status initialize_fine_grid();
+
+  // Validates the input fine grid dimension, returning a potentially
+  // modified valid value. This is specialized for CPU and GPU.
+  virtual int validate_fine_grid_dimension(int idx, int dim) const = 0;
 
   // Initializes the FFT library and plan.
   virtual Status initialize_fft() = 0;
@@ -383,6 +396,30 @@ class Plan<CPUDevice, FloatType> : public PlanBase<CPUDevice, FloatType> {
   Status spread(DType* c, DType* f) override;
 
  protected:
+  // Returns the default upsampling factor.
+  virtual double default_upsampling_factor() const override;
+
+  // Returns the default kernel evaluation algorithm.
+  virtual KernelEvalAlgo default_kernel_eval_algo() const override;
+
+  // Checks that the kernel evaluation algorithm is valid.
+  virtual Status check_kernel_eval_algo(KernelEvalAlgo algo) const override;
+
+  // Validates the input fine grid dimension, returning a potentially
+  // modified valid value.
+  int validate_fine_grid_dimension(int idx, int dim) const override;
+
+  // Initializes the FFT library and plan.
+  // Sets this->fft_plan_.
+  Status initialize_fft() override;
+
+  // Retrieves the default Thrust execution policy.
+  const ExecutionPolicyType execution_policy() const override {
+    // TODO: consider using a multi-threaded policy.
+    return thrust::cpp::par;
+  }
+
+ protected:
 
   // Magland Dec 2016. Barnett openmp version, many speedups 1/16/17-2/16/17
   // error codes 3/13/17. pirange 3/28/17. Rewritten 6/15/17. parallel sort 2/9/18
@@ -429,16 +466,6 @@ class Plan<CPUDevice, FloatType> : public PlanBase<CPUDevice, FloatType> {
       DType* fk, DType* fw, FloatType prefactor = FloatType(1.0));
   void deconvolve_3d(
       DType* fk, DType* fw, FloatType prefactor = FloatType(1.0));
-
-  // Initializes the FFT library and plan.
-  // Sets this->fft_plan_.
-  Status initialize_fft() override;
-
-  // Retrieves the default Thrust execution policy.
-  const ExecutionPolicyType execution_policy() const override {
-    // TODO: consider using a multi-threaded policy.
-    return thrust::cpp::par;
-  }
 
  public:  // TODO(jmontalt): make private after refactoring FINUFFT.
 
@@ -494,14 +521,20 @@ class Plan<GPUDevice, FloatType> : public PlanBase<GPUDevice, FloatType> {
   Status spread(DType* d_c, DType* d_fk) override;
 
  protected:
-  // Retrieves the default Thrust execution policy.
-  const ExecutionPolicyType execution_policy() const override {
-    // TODO: consider using par_nosync once Thrust gets upgraded to 1.16.
-    return thrust::cuda::par.on(this->device_.stream());
-  }
-
- protected:
   static int64_t CufftScratchSize;
+
+  // Returns the default upsampling factor.
+  virtual double default_upsampling_factor() const override;
+
+  // Returns the default kernel evaluation algorithm.
+  virtual KernelEvalAlgo default_kernel_eval_algo() const override;
+
+  // Checks that the kernel evaluation algorithm is valid.
+  virtual Status check_kernel_eval_algo(KernelEvalAlgo algo) const override;
+
+  // Validates the input fine grid dimension, returning a potentially
+  // modified valid value.
+  int validate_fine_grid_dimension(int idx, int dim) const override;
 
   // Initializes the FFT library and plan.
   Status initialize_fft() override;
@@ -512,6 +545,12 @@ class Plan<GPUDevice, FloatType> : public PlanBase<GPUDevice, FloatType> {
   // Initializes subproblems for subproblem-based interpolation/spreading.
   Status initialize_subproblems();
 
+  // Retrieves the default Thrust execution policy.
+  const ExecutionPolicyType execution_policy() const override {
+    // TODO: consider using par_nosync once Thrust gets upgraded to 1.16.
+    return thrust::cuda::par.on(this->device_.stream());
+  }
+
  private:
   Status spread_batch(int batch_size);
   Status interp_batch(int batch_size);
@@ -521,11 +560,6 @@ class Plan<GPUDevice, FloatType> : public PlanBase<GPUDevice, FloatType> {
   Status interp_batch_subproblem(int batch_size);
   // Deconvolve and/or amplify a batch of data.
   Status deconvolve_batch(int batch_size);
-  // Batch of fine grids for cuFFT to plan and execute. This is usually the
-  // largest array allocated by NUFFT.
-  Tensor fine_tensor_;
-  // A convenience pointer to the fine grid array.
-  DType* fine_data_;
   // Tensors in device memory. Used for deconvolution. Empty in spread/interp
   // mode. Only the first `rank` tensors are allocated.
   Tensor fseries_tensor_[3];
@@ -694,15 +728,8 @@ Status PlanBase<Device, FloatType>::set_default_options() {
   // Upsampling factor.
   double upsampling_factor = this->options_.upsampling_factor;
   if (upsampling_factor == 0.0) {
-    // In general, the upsampling factor is 2.0.
-    upsampling_factor = 2.0;
-    // In certain circumstances, an upsampling factor of 1.25 is enough.
-    if (this->tol_ >= FloatType(1e-9)) {
-      if ((this->rank_ == 1 && this->grid_size_ > 10000000) ||
-          (this->rank_ == 2 && this->grid_size_ > 300000) ||
-          (this->rank_ == 3 && this->grid_size_ > 3000000))
-        upsampling_factor = 1.25;
-    }
+    // Use default upsampling factor.
+    upsampling_factor = this->default_upsampling_factor();
   } else {
     // User-specified value. Do input checking.
     if (upsampling_factor <= 1.0) {
@@ -711,6 +738,15 @@ Status PlanBase<Device, FloatType>::set_default_options() {
     }
   }
   this->options_.upsampling_factor = upsampling_factor;
+
+  // Kernel evaluation algorithm.
+  KernelEvalAlgo kernel_eval_algo = this->options_.kernel_eval_algo;
+  if (kernel_eval_algo == KernelEvalAlgo::AUTO) {
+    kernel_eval_algo = this->default_kernel_eval_algo();
+  } else {
+    TF_RETURN_IF_ERROR(this->check_kernel_eval_algo(kernel_eval_algo));
+  }
+  this->options_.kernel_eval_algo = kernel_eval_algo;
 
   // Kernel width.
   int kernel_width = 0;
@@ -753,11 +789,13 @@ Status PlanBase<Device, FloatType>::initialize_fine_grid() {
     }
 
     // Make sure fine grid is at least as large as the kernel.
-    if (this->fine_dims_[d] < 2 * this->options_.kernel_width)
+    if (this->fine_dims_[d] < 2 * this->options_.kernel_width) {
       this->fine_dims_[d] = 2 * this->options_.kernel_width;
+    }
 
     // Find the next smooth integer.
-    this->fine_dims_[d] = next_smooth_integer(this->fine_dims_[d]);
+    this->fine_dims_[d] = this->validate_fine_grid_dimension(
+        d, this->fine_dims_[d]);
 
     // For spread-only operation, make sure that the grid size is valid.
     if (this->options_.spread_only &&
@@ -787,9 +825,11 @@ Status PlanBase<Device, FloatType>::initialize_fine_grid() {
   if (!this->options_.spread_only) {
     TensorShape fine_shape({this->fine_size_ * this->batch_size_});
     TF_RETURN_IF_ERROR(this->context_->allocate_temp(
-        DataTypeToEnum<DType>::value, fine_shape, &this->fine_tensor_));
+        DataTypeToEnum<std::complex<FloatType>>::value,
+        fine_shape,
+        &this->fine_tensor_));
     this->fine_data_ = reinterpret_cast<DType*>(
-        this->fine_tensor_.flat<DType>().data());
+        this->fine_tensor_.flat<std::complex<FloatType>>().data());
   }
 
   return OkStatus();

@@ -116,22 +116,6 @@ void kernel_fseries_1d(int grid_size,
   }
 }
 
-template<typename IntType>
-IntType next_smooth_int(IntType n, IntType b) {
-  if (n <= 2) return 2;
-  if (n % 2 == 1) n += 1;   // even
-  IntType nplus = n - 2;    // to cancel out the +=2 at start of loop
-  IntType numdiv = 2;       // a dummy that is >1
-  while ((numdiv > 1) || (nplus % b != 0)) {
-    nplus += 2;         // stays even
-    numdiv = nplus;
-    while (numdiv % 2 == 0) numdiv /= 2;  // remove all factors of 2,3,5...
-    while (numdiv % 3 == 0) numdiv /= 3;
-    while (numdiv % 5 == 0) numdiv /= 5;
-  }
-  return nplus;
-}
-
 template<typename FloatType>
 void array_range(int64_t n, FloatType* a, FloatType *lo, FloatType *hi) {
   *lo = INFINITY; *hi = -INFINITY;
@@ -150,9 +134,6 @@ template void kernel_fseries_1d<float>(
     int, const SpreadParameters<float>&, float*);
 template void kernel_fseries_1d<double>(
     int, const SpreadParameters<double>&, double*);
-
-template int next_smooth_int<int>(int, int);
-template int64_t next_smooth_int<int64_t>(int64_t, int64_t);
 
 template void array_range<float>(int64_t, float*, float*, float*);
 template void array_range<double>(int64_t, double*, double*, double*);

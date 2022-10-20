@@ -61,12 +61,6 @@ void kernel_fseries_1d(int grid_size,
                        const SpreadParameters<FloatType>& spread_params,
                        FloatType* fseries_coeffs);
 
-// Finds even integer not less than n, with prime factors no larger than 5
-// (ie, "smooth"). If b is specified, the returned number must also be a
-// multiple of b (b must be a number whose prime factors are no larger than 5).
-template<typename IntType>
-IntType next_smooth_int(IntType n, IntType b = 1);
-
 // With a a length-n array, writes out min(a) to lo and max(a) to hi,
 // so that all a values lie in [lo,hi].
 // If n==0, lo and hi are not finite.

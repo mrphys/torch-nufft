@@ -134,14 +134,8 @@ int64_t GetCufftWorkspaceLimit(const string& envvar_in_mb,
 }
 
 template<typename FloatType>
-Status setup_spreader(int rank, FloatType eps, double upsampling_factor,
-                      KernelEvaluationMethod kernel_evaluation_method,
+Status setup_spreader(int rank, const InternalOptions& options,
                       SpreadParameters<FloatType>& spread_params);
-
-template<typename FloatType>
-Status setup_spreader_for_nufft(int rank, FloatType eps,
-                                const InternalOptions& options,
-                                SpreadParameters<FloatType> &spread_params);
 
 void set_bin_sizes(TransformType type, int rank, InternalOptions& options);
 
@@ -651,8 +645,16 @@ __global__ void SpreadSubproblemHorner1DKernel(
 
 template<typename FloatType>
 __global__ void InterpNuptsDriven1DKernel(
-    FloatType *x, GpuComplex<FloatType> *c, GpuComplex<FloatType> *fw, int M, const int ns,
-    int nf1, FloatType es_c, FloatType es_beta, int* idxnupts, int pirange) {
+    FloatType *x,
+    GpuComplex<FloatType> *c,
+    GpuComplex<FloatType> *fw,
+    int M,
+    const int ns,
+    int nf1,
+    FloatType es_c,
+    FloatType es_beta,
+    int* idxnupts,
+    int pirange) {
 	FloatType ker1[kMaxKernelWidth];
 	for (int i = blockDim.x * blockIdx.x + threadIdx.x; i < M; i += blockDim.x*gridDim.x){
 		FloatType x_rescaled=FOLD_AND_RESCALE(x[idxnupts[i]], nf1, pirange);
@@ -678,8 +680,15 @@ __global__ void InterpNuptsDriven1DKernel(
 
 template<typename FloatType>
 __global__ void InterpNuptsDrivenHorner1DKernel(
-    FloatType *x, GpuComplex<FloatType> *c, GpuComplex<FloatType> *fw, int M,
-	  const int ns, int nf1, FloatType sigma, int* idxnupts, int pirange) {
+    FloatType *x,
+    GpuComplex<FloatType> *c,
+    GpuComplex<FloatType> *fw,
+    int M,
+	  const int ns,
+    int nf1,
+    FloatType sigma,
+    int* idxnupts,
+    int pirange) {
 	for(int i = blockDim.x*blockIdx.x+threadIdx.x; i < M; i += blockDim.x * gridDim.x){
 		FloatType x_rescaled=FOLD_AND_RESCALE(x[idxnupts[i]], nf1, pirange);
 
@@ -1840,21 +1849,21 @@ Status Plan<GPUDevice, FloatType>::initialize(
     return errors::InvalidArgument("num_transforms must be >= 1");
   }
 
-  // TODO(jmontalt): check options.
-  //  - If mode_order == FFT, raise unimplemented error.
-
-  // Copy options.
+  this->rank_ = rank;
+  this->type_ = type;
+  this->fft_direction_ = fft_direction;
+  this->num_transforms_ = num_transforms;
+  this->tol_ = std::max(tol, kEpsilon<FloatType>);
   this->options_ = options;
 
-  // Select kernel evaluation method.
-  if (this->options_.kernel_evaluation_method == KernelEvaluationMethod::AUTO) {
-    this->options_.kernel_evaluation_method = KernelEvaluationMethod::DIRECT;
-  }
+  this->grid_dims_[0] = grid_dims[0];
+  this->grid_dims_[1] = (this->rank_ > 1) ? grid_dims[1] : 1;
+  this->grid_dims_[2] = (this->rank_ > 2) ? grid_dims[2] : 1;
+  this->grid_size_ = this->grid_dims_[0] * this->grid_dims_[1] *
+                     this->grid_dims_[2];
 
-  // Select upsampling factor. Currently always defaults to 2.
-  if (this->options_.upsampling_factor == 0.0) {
-    this->options_.upsampling_factor = 2.0;
-  }
+  // TODO(jmontalt): check options.
+  //  - If mode_order == FFT, raise unimplemented error.
 
   // Configure threading (irrelevant for GPU computation, but is used for some
   // CPU computations).
@@ -1878,47 +1887,8 @@ Status Plan<GPUDevice, FloatType>::initialize(
     }
   }
 
-  // This must be set before calling setup_spreader_for_nufft.
-  this->spread_params_.spread_only = this->options_.spread_only;
-
-  // Setup spreading options.
-  TF_RETURN_IF_ERROR(setup_spreader_for_nufft(
-      rank, tol, this->options_, this->spread_params_));
-
-  this->rank_ = rank;
-  this->grid_dims_[0] = grid_dims[0];
-  this->grid_dims_[1] = (this->rank_ > 1) ? grid_dims[1] : 1;
-  this->grid_dims_[2] = (this->rank_ > 2) ? grid_dims[2] : 1;
-  this->grid_size_ = this->grid_dims_[0] * this->grid_dims_[1] *
-                      this->grid_dims_[2];
-
   // Set the bin sizes.
   set_bin_sizes(type, rank, this->options_);
-
-  // Set the grid sizes.
-  TF_RETURN_IF_ERROR(set_grid_size(
-      this->grid_dims_[0], this->options_.gpu_obin_size.x,
-      this->options_, this->spread_params_, &this->fine_dims_[0]));
-  if (rank > 1) {
-    TF_RETURN_IF_ERROR(set_grid_size(
-        this->grid_dims_[1], this->options_.gpu_obin_size.y,
-        this->options_, this->spread_params_, &this->fine_dims_[1]));
-  } else {
-    this->fine_dims_[1] = 1;
-  }
-  if (rank > 2) {
-    TF_RETURN_IF_ERROR(set_grid_size(
-        this->grid_dims_[2], this->options_.gpu_obin_size.z,
-        this->options_, this->spread_params_, &this->fine_dims_[2]));
-  } else {
-    this->fine_dims_[2] = 1;
-  }
-
-  this->fine_size_ = this->fine_dims_[0] * this->fine_dims_[1] *
-                     this->fine_dims_[2];
-  this->fft_direction_ = fft_direction;
-  this->num_transforms_ = num_transforms;
-  this->type_ = type;
 
   // Set batch size.
   if (this->options_.max_batch_size() == 0) {
@@ -1926,6 +1896,16 @@ Status Plan<GPUDevice, FloatType>::initialize(
   } else {
     this->batch_size_ = this->options_.max_batch_size();
   }
+
+  // Set default options.
+  TF_RETURN_IF_ERROR(this->set_default_options());
+
+  // Initialize the fine grid and related quantities.
+  TF_RETURN_IF_ERROR(this->initialize_fine_grid());
+
+  // Setup spreading options.
+  TF_RETURN_IF_ERROR(setup_spreader(
+      rank, this->options_, this->spread_params_));
 
   if (this->type_ == TransformType::TYPE_1)
     this->spread_params_.spread_direction = SpreadDirection::SPREAD;
@@ -1977,14 +1957,6 @@ Status Plan<GPUDevice, FloatType>::initialize(
 
   // Perform some actions not needed in spread / interp only mode.
   if (!this->options_.spread_only) {
-    // Allocate fine grid and set convenience pointer.
-    TF_RETURN_IF_ERROR(this->context_->allocate_temp(
-        DataTypeToEnum<std::complex<FloatType>>::value,
-        TensorShape({this->fine_size_ * this->batch_size_}),
-        &this->fine_tensor_));
-    this->fine_data_ = reinterpret_cast<DType*>(
-        this->fine_tensor_.flat<std::complex<FloatType>>().data());
-
     // For each dimension, calculate Fourier coefficients of the kernel for
     // deconvolution. The computation is performed on the CPU before
     // transferring the results the GPU.
@@ -2146,10 +2118,12 @@ Status Plan<GPUDevice, FloatType>::execute(DType* d_c, DType* d_fk) {
 
     // Step 2: FFT (type 1 and/or 2).
     auto src = AsDeviceMemory<std::complex<FloatType>>(
-        this->fine_tensor_.flat<std::complex<FloatType>>().data(),
+        reinterpret_cast<std::complex<FloatType>*>(this->fine_data_),
         this->fine_tensor_.shape().num_elements());
-    if (!stream->ThenFft(this->fft_plan_.get(), src, &src).ok())
+
+    if (!stream->ThenFft(this->fft_plan_.get(), src, &src).ok()) {
       return errors::Internal("fft failed");
+    }
 
     // Step 3: deconvolve (type 1) or interp (type 2).
     switch (this->type_) {
@@ -2222,6 +2196,40 @@ Status Plan<GPUDevice, FloatType>::spread(DType* d_c, DType* d_fk) {
                         this->spread_params_.kernel_scale));
 
   return OkStatus();
+}
+
+template<typename FloatType>
+double Plan<GPUDevice, FloatType>::default_upsampling_factor() const {
+  return 2.0;
+}
+
+template<typename FloatType>
+KernelEvalAlgo Plan<GPUDevice, FloatType>::default_kernel_eval_algo() const {
+  return KernelEvalAlgo::DIRECT;
+}
+
+template<typename FloatType>
+Status Plan<GPUDevice, FloatType>::check_kernel_eval_algo(
+    KernelEvalAlgo kernel_eval_algo) const {
+  if (kernel_eval_algo == KernelEvalAlgo::HORNER &&
+      this->options_.upsampling_factor != 2.0) {
+    return errors::Unimplemented(
+        "Horner kernel evaluation algorithm is only implemented for "
+        "upsampling factor equal to 2.0 (GPU).");
+  }
+  return OkStatus();
+}
+
+template<typename FloatType>
+int Plan<GPUDevice, FloatType>::validate_fine_grid_dimension(
+    int idx, int dim) const {
+  if (this->options_.spread_method == SpreadMethod::BLOCK_GATHER) {
+    int obin_size = static_cast<int>(
+        reinterpret_cast<const unsigned int*>(
+            &this->options_.gpu_obin_size)[idx]);
+    return next_smooth_integer(dim, obin_size);
+  }
+  return next_smooth_integer(dim);
 }
 
 template<typename FloatType>
@@ -2343,8 +2351,8 @@ Status Plan<GPUDevice, FloatType>::spread_batch_nupts_driven(int batch_size) {
 
   switch (this->rank_) {
     case 1:
-      switch (this->options_.kernel_evaluation_method) {
-        case KernelEvaluationMethod::DIRECT:
+      switch (this->options_.kernel_eval_algo) {
+        case KernelEvalAlgo::DIRECT:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 SpreadNuptsDriven1DKernel<FloatType>, num_blocks,
@@ -2355,7 +2363,7 @@ Status Plan<GPUDevice, FloatType>::spread_batch_nupts_driven(int batch_size) {
                 this->idx_nupts_, pirange));
           }
           break;
-        case KernelEvaluationMethod::HORNER:
+        case KernelEvalAlgo::HORNER:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 SpreadNuptsDrivenHorner1DKernel<FloatType>, num_blocks,
@@ -2369,8 +2377,8 @@ Status Plan<GPUDevice, FloatType>::spread_batch_nupts_driven(int batch_size) {
       }
       break;
     case 2:
-      switch (this->options_.kernel_evaluation_method) {
-        case KernelEvaluationMethod::DIRECT:
+      switch (this->options_.kernel_eval_algo) {
+        case KernelEvalAlgo::DIRECT:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 SpreadNuptsDriven2DKernel<FloatType>, num_blocks,
@@ -2381,7 +2389,7 @@ Status Plan<GPUDevice, FloatType>::spread_batch_nupts_driven(int batch_size) {
                 this->idx_nupts_, pirange));
           }
           break;
-        case KernelEvaluationMethod::HORNER:
+        case KernelEvalAlgo::HORNER:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 SpreadNuptsDrivenHorner2DKernel<FloatType>, num_blocks,
@@ -2395,12 +2403,12 @@ Status Plan<GPUDevice, FloatType>::spread_batch_nupts_driven(int batch_size) {
         default:
           return errors::Internal(
               "Invalid kernel evaluation method: ", static_cast<int>(
-                  this->options_.kernel_evaluation_method));
+                  this->options_.kernel_eval_algo));
       }
       break;
     case 3:
-      switch (this->options_.kernel_evaluation_method) {
-        case KernelEvaluationMethod::DIRECT:
+      switch (this->options_.kernel_eval_algo) {
+        case KernelEvalAlgo::DIRECT:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 SpreadNuptsDriven3DKernel<FloatType>, num_blocks,
@@ -2411,7 +2419,7 @@ Status Plan<GPUDevice, FloatType>::spread_batch_nupts_driven(int batch_size) {
                 es_c, es_beta, this->idx_nupts_, pirange));
           }
           break;
-        case KernelEvaluationMethod::HORNER:
+        case KernelEvalAlgo::HORNER:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 SpreadNuptsDrivenHorner3DKernel<FloatType>, num_blocks,
@@ -2425,7 +2433,7 @@ Status Plan<GPUDevice, FloatType>::spread_batch_nupts_driven(int batch_size) {
         default:
           return errors::Internal(
               "Invalid kernel evaluation method: ", static_cast<int>(
-                  this->options_.kernel_evaluation_method));
+                  this->options_.kernel_eval_algo));
       }
       break;
     default:
@@ -2464,8 +2472,8 @@ Status Plan<GPUDevice, FloatType>::spread_batch_subproblem(int batch_size) {
 
   switch (this->rank_) {
     case 1:
-      switch (this->options_.kernel_evaluation_method) {
-        case KernelEvaluationMethod::DIRECT:
+      switch (this->options_.kernel_eval_algo) {
+        case KernelEvalAlgo::DIRECT:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 SpreadSubproblem1DKernel<FloatType>, num_blocks,
@@ -2479,7 +2487,7 @@ Status Plan<GPUDevice, FloatType>::spread_batch_subproblem(int batch_size) {
                 this->idx_nupts_, pirange));
           }
           break;
-        case KernelEvaluationMethod::HORNER:
+        case KernelEvalAlgo::HORNER:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 SpreadSubproblemHorner1DKernel<FloatType>, num_blocks,
@@ -2495,12 +2503,12 @@ Status Plan<GPUDevice, FloatType>::spread_batch_subproblem(int batch_size) {
         default:
           return errors::Internal(
               "Invalid kernel evaluation method: ", static_cast<int>(
-                  this->options_.kernel_evaluation_method));
+                  this->options_.kernel_eval_algo));
       }
       break;
     case 2:
-      switch (this->options_.kernel_evaluation_method) {
-        case KernelEvaluationMethod::DIRECT:
+      switch (this->options_.kernel_eval_algo) {
+        case KernelEvalAlgo::DIRECT:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 SpreadSubproblem2DKernel<FloatType>, num_blocks,
@@ -2515,7 +2523,7 @@ Status Plan<GPUDevice, FloatType>::spread_batch_subproblem(int batch_size) {
                 pirange));
           }
           break;
-        case KernelEvaluationMethod::HORNER:
+        case KernelEvalAlgo::HORNER:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 SpreadSubproblemHorner2DKernel<FloatType>, num_blocks,
@@ -2533,12 +2541,12 @@ Status Plan<GPUDevice, FloatType>::spread_batch_subproblem(int batch_size) {
         default:
           return errors::Internal(
               "Invalid kernel evaluation method: ", static_cast<int>(
-                  this->options_.kernel_evaluation_method));
+                  this->options_.kernel_eval_algo));
       }
       break;
     case 3:
-      switch (this->options_.kernel_evaluation_method) {
-        case KernelEvaluationMethod::DIRECT:
+      switch (this->options_.kernel_eval_algo) {
+        case KernelEvalAlgo::DIRECT:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 SpreadSubproblem3DKernel<FloatType>, num_blocks,
@@ -2554,7 +2562,7 @@ Status Plan<GPUDevice, FloatType>::spread_batch_subproblem(int batch_size) {
                 this->idx_nupts_, pirange));
           }
           break;
-        case KernelEvaluationMethod::HORNER:
+        case KernelEvalAlgo::HORNER:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 SpreadSubproblemHorner3DKernel<FloatType>, num_blocks,
@@ -2573,7 +2581,7 @@ Status Plan<GPUDevice, FloatType>::spread_batch_subproblem(int batch_size) {
         default:
           return errors::Internal(
               "Invalid kernel evaluation method: ", static_cast<int>(
-                  this->options_.kernel_evaluation_method));
+                  this->options_.kernel_eval_algo));
       }
       break;
     default:
@@ -2604,8 +2612,8 @@ Status Plan<GPUDevice, FloatType>::interp_batch_nupts_driven(int batch_size) {
                      threads_per_block.x;
       num_blocks.y = 1;
 
-      switch (this->options_.kernel_evaluation_method) {
-        case KernelEvaluationMethod::DIRECT:
+      switch (this->options_.kernel_eval_algo) {
+        case KernelEvalAlgo::DIRECT:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 InterpNuptsDriven1DKernel<FloatType>, num_blocks,
@@ -2616,7 +2624,7 @@ Status Plan<GPUDevice, FloatType>::interp_batch_nupts_driven(int batch_size) {
                 this->idx_nupts_, pirange));
           }
           break;
-        case KernelEvaluationMethod::HORNER:
+        case KernelEvalAlgo::HORNER:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 InterpNuptsDrivenHorner1DKernel<FloatType>, num_blocks,
@@ -2630,7 +2638,7 @@ Status Plan<GPUDevice, FloatType>::interp_batch_nupts_driven(int batch_size) {
         default:
           return errors::Internal(
               "Invalid kernel evaluation method: ", static_cast<int>(
-                  this->options_.kernel_evaluation_method));
+                  this->options_.kernel_eval_algo));
       }
       break;
     case 2:
@@ -2640,8 +2648,8 @@ Status Plan<GPUDevice, FloatType>::interp_batch_nupts_driven(int batch_size) {
                      threads_per_block.x;
       num_blocks.y = 1;
 
-      switch (this->options_.kernel_evaluation_method) {
-        case KernelEvaluationMethod::DIRECT:
+      switch (this->options_.kernel_eval_algo) {
+        case KernelEvalAlgo::DIRECT:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 InterpNuptsDriven2DKernel<FloatType>, num_blocks,
@@ -2652,7 +2660,7 @@ Status Plan<GPUDevice, FloatType>::interp_batch_nupts_driven(int batch_size) {
                 this->idx_nupts_, pirange));
           }
           break;
-        case KernelEvaluationMethod::HORNER:
+        case KernelEvalAlgo::HORNER:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 InterpNuptsDrivenHorner2DKernel<FloatType>, num_blocks,
@@ -2666,7 +2674,7 @@ Status Plan<GPUDevice, FloatType>::interp_batch_nupts_driven(int batch_size) {
         default:
           return errors::Internal(
               "Invalid kernel evaluation method: ", static_cast<int>(
-                  this->options_.kernel_evaluation_method));
+                  this->options_.kernel_eval_algo));
       }
       break;
     case 3:
@@ -2675,8 +2683,8 @@ Status Plan<GPUDevice, FloatType>::interp_batch_nupts_driven(int batch_size) {
       num_blocks.x = (this->num_points_ + threads_per_block.x - 1) /
                      threads_per_block.x;
       num_blocks.y = 1;
-      switch (this->options_.kernel_evaluation_method) {
-        case KernelEvaluationMethod::DIRECT:
+      switch (this->options_.kernel_eval_algo) {
+        case KernelEvalAlgo::DIRECT:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 InterpNuptsDriven3DKernel<FloatType>, num_blocks,
@@ -2687,7 +2695,7 @@ Status Plan<GPUDevice, FloatType>::interp_batch_nupts_driven(int batch_size) {
                 es_c, es_beta, this->idx_nupts_, pirange));
           }
           break;
-        case KernelEvaluationMethod::HORNER:
+        case KernelEvalAlgo::HORNER:
           for (int t = 0; t < batch_size; t++) {
             TF_CHECK_OK(GpuLaunchKernel(
                 InterpNuptsDrivenHorner3DKernel<FloatType>, num_blocks,
@@ -2701,7 +2709,7 @@ Status Plan<GPUDevice, FloatType>::interp_batch_nupts_driven(int batch_size) {
         default:
           return errors::Internal(
               "Invalid kernel evaluation method: ", static_cast<int>(
-                  this->options_.kernel_evaluation_method));
+                  this->options_.kernel_eval_algo));
       }
       break;
     default:
@@ -2745,8 +2753,8 @@ Status Plan<GPUDevice, FloatType>::interp_batch_subproblem(int batch_size) {
           "subproblem method is not implemented for 1D interpolation");
       break;
     case 2:
-      if (this->options_.kernel_evaluation_method ==
-          KernelEvaluationMethod::HORNER) {
+      if (this->options_.kernel_eval_algo ==
+          KernelEvalAlgo::HORNER) {
         for (int t = 0; t < batch_size; t++) {
           TF_CHECK_OK(GpuLaunchKernel(
               InterpSubproblemHorner2DKernel<FloatType>, num_blocks,
@@ -2776,8 +2784,8 @@ Status Plan<GPUDevice, FloatType>::interp_batch_subproblem(int batch_size) {
       break;
     case 3:
       for (int t = 0; t < batch_size; t++) {
-        if (this->options_.kernel_evaluation_method ==
-            KernelEvaluationMethod::HORNER) {
+        if (this->options_.kernel_eval_algo ==
+            KernelEvalAlgo::HORNER) {
           TF_CHECK_OK(GpuLaunchKernel(
               InterpSubproblemHorner3DKernel<FloatType>, num_blocks,
               threads_per_block, shared_memory_size, this->device_.stream(),
@@ -3038,40 +3046,17 @@ namespace {
 // Also sets all default options in SpreadParameters<FloatType>.
 // Must call before any kernel evals done.
 template<typename FloatType>
-Status setup_spreader(int rank, FloatType eps, double upsampling_factor,
-                      KernelEvaluationMethod kernel_evaluation_method,
+Status setup_spreader(int rank,
+                      const InternalOptions& options,
                       SpreadParameters<FloatType>& spread_params) {
-  if (upsampling_factor != 2.0) {
-    if (kernel_evaluation_method == KernelEvaluationMethod::HORNER) {
-      return errors::Internal(
-          "Horner kernel evaluation only supports the standard "
-          "upsampling factor of 2.0, but got ", upsampling_factor);
-    }
-    if (upsampling_factor <= 1.0) {
-      return errors::Internal(
-          "upsampling_factor must be > 1.0, but is ", upsampling_factor);
-    }
-  }
+  spread_params.spread_only = options.spread_only;
 
   // defaults... (user can change after this function called)
   spread_params.spread_direction = SpreadDirection::SPREAD;
   spread_params.pirange = 1;             // user also should always set this
-  spread_params.upsampling_factor = upsampling_factor;
+  spread_params.upsampling_factor = options.upsampling_factor;
 
-  // as in FINUFFT v2.0, allow too - small - eps by truncating to eps_mach...
-  if (eps < kEpsilon<FloatType>) {
-    eps = kEpsilon<FloatType>;
-  }
-
-  // Set kernel width w (aka ns) and ES kernel beta parameter, in spread_params.
-  int ns = std::ceil(-log10(eps / (FloatType)10.0));  // 1 digit per power of 10
-  if (upsampling_factor != 2.0)           // override ns for custom sigma
-    ns = std::ceil(-log(eps) / (kPi<FloatType> * sqrt(
-        1.0 - 1.0 / upsampling_factor)));  // formula, gamma = 1
-  ns = max(2, ns);               // we don't have ns = 1 version yet
-  if (ns > kMaxKernelWidth) {         // clip to match allocated arrays
-    ns = kMaxKernelWidth;
-  }
+  int ns = options.kernel_width;
   spread_params.kernel_width = ns;
 
   // Values to simplify kernel evaluation.
@@ -3086,27 +3071,14 @@ Status setup_spreader(int rank, FloatType eps, double upsampling_factor,
   if (ns == 3) beta_over_ns = 2.26;
   if (ns == 4) beta_over_ns = 2.38;
   // Override beta for non - default oversampling factors.
-  if (upsampling_factor != 2.0) {
+  if (options.upsampling_factor != 2.0) {
     FloatType gamma = 0.97;  // This value must match the one in generated code.
-    beta_over_ns = gamma * kPi<FloatType> * (1 - 1 / (2 * upsampling_factor));
+    beta_over_ns = gamma * kPi<FloatType> * (1 - 1 / (2 * options.upsampling_factor));
   }
   spread_params.kernel_beta = beta_over_ns * static_cast<FloatType>(ns);
 
   if (spread_params.spread_only)
     spread_params.kernel_scale = calculate_scale_factor(rank, spread_params);
-
-  return OkStatus();
-}
-
-// Set up the spreader parameters given eps, and pass across various nufft
-// options. Report status of setup_spreader.  Barnett 10 / 30 / 17
-template<typename FloatType>
-Status setup_spreader_for_nufft(int rank, FloatType eps,
-                                const InternalOptions& options,
-                                SpreadParameters<FloatType>& spread_params) {
-  TF_RETURN_IF_ERROR(setup_spreader(
-      rank, eps, options.upsampling_factor,
-      options.kernel_evaluation_method, spread_params));
 
   spread_params.sort_points = options.sort_points;
   spread_params.spread_method = options.spread_method;
@@ -3161,46 +3133,6 @@ void set_bin_sizes(TransformType type, int rank, InternalOptions& options) {
       }
       break;
   }
-}
-
-template<typename FloatType>
-Status set_grid_size(int ms,
-                     int bin_size,
-                     const InternalOptions& options,
-                     const SpreadParameters<FloatType>& spread_params,
-                     int* grid_size) {
-  // For spread / interp only, we do not apply oversampling.
-  if (options.spread_only) {
-    *grid_size = ms;
-  } else {
-    *grid_size = static_cast<int>(options.upsampling_factor * ms);
-  }
-
-  // This is required to avoid errors.
-  if (*grid_size < 2 * spread_params.kernel_width)
-    *grid_size = 2 * spread_params.kernel_width;
-
-  // Check if array size is too big.
-  if (*grid_size > kMaxArraySize) {
-    return errors::Internal(
-        "Upsampled dim size too big: ", *grid_size, " > ", kMaxArraySize);
-  }
-
-  // Find the next smooth integer.
-  if (options.spread_method == SpreadMethod::BLOCK_GATHER)
-    *grid_size = next_smooth_int(*grid_size, bin_size);
-  else
-    *grid_size = next_smooth_int(*grid_size);
-
-  // For spread / interp only mode, make sure that the grid size is valid.
-  if (options.spread_only && *grid_size != ms) {
-    return errors::Internal(
-        "Invalid grid size: ", ms, ". Value should be even, "
-        "larger than the kernel (", 2 * spread_params.kernel_width,
-        ") and have no prime factors larger than 5.");
-  }
-
-  return OkStatus();
 }
 
 }  // namespace
