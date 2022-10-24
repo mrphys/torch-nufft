@@ -646,8 +646,8 @@ __global__ void SpreadSubproblemHorner1DKernel(
 template<typename FloatType>
 __global__ void InterpNuptsDriven1DKernel(
     FloatType *x,
-    GpuComplex<FloatType> *c,
-    GpuComplex<FloatType> *fw,
+    GpuComplex<FloatType>* c,
+    GpuComplex<FloatType>* fw,
     int M,
     const int ns,
     int nf1,
@@ -680,9 +680,9 @@ __global__ void InterpNuptsDriven1DKernel(
 
 template<typename FloatType>
 __global__ void InterpNuptsDrivenHorner1DKernel(
-    FloatType *x,
-    GpuComplex<FloatType> *c,
-    GpuComplex<FloatType> *fw,
+    FloatType* x,
+    GpuComplex<FloatType>* c,
+    GpuComplex<FloatType>* fw,
     int M,
 	  const int ns,
     int nf1,
@@ -1900,6 +1900,9 @@ Status Plan<GPUDevice, FloatType>::initialize(
   // Set default options.
   TF_RETURN_IF_ERROR(this->set_default_options());
 
+  // Initialize the interpolator.
+  TF_RETURN_IF_ERROR(this->initialize_interpolator());
+
   // Initialize the fine grid and related quantities.
   TF_RETURN_IF_ERROR(this->initialize_fine_grid());
 
@@ -2003,7 +2006,6 @@ Status Plan<GPUDevice, FloatType>::initialize(
 
 template<typename FloatType>
 Plan<GPUDevice, FloatType>::~Plan() {
-
   // Free memory allocated on the device. Some of these pointers are not
   // guaranteed to be allocated, but that's ok because `deallocate` will
   // perform no operation if passed a null pointer.

@@ -134,6 +134,15 @@ enum class SpreadDirection {
   INTERP   // uniform to non-uniform
 };
 
+// Parameters for the interpolation kernel.
+template<typename FloatType>
+struct KernelArgs {
+  int w;  // width
+  FloatType hw;  // half-width
+  FloatType beta;  // constant beta
+  FloatType c;  // constant c
+};
+
 template<typename FloatType>
 struct SpreadParameters {
   // The spread direction (U->NU or NU->U). See enum above.
@@ -163,12 +172,6 @@ struct SpreadParameters {
                           // if changed from 0!). See spreadinterp.h
   int verbosity;          // 0: silent, 1: small text output, 2: verbose
   double upsampling_factor;       // sigma, upsampling factor
-  // Parameters of the "exponential of semicircle" spreading kernel.
-  int kernel_width;
-  FloatType kernel_beta;
-  FloatType kernel_half_width;
-  FloatType kernel_c;
-  FloatType kernel_scale;
 
   #if GOOGLE_CUDA
   // Used for 3D subproblem method. 0 means automatic selection.
@@ -258,7 +261,7 @@ class PlanBase {
   // initialize(...)
 
   // Sets default values for unset options.
-  // Sets: options_.upsampling_factor, options_.kernel_width.
+  // Sets: options_.upsampling_factor, options_.kernel_eval_algo.
   // Requires: tol_ must be set.
   // this->options_ is valid after calling this function.
   Status set_default_options();
@@ -272,9 +275,15 @@ class PlanBase {
   // Checks that the kernel evaluation algorithm is valid.
   virtual Status check_kernel_eval_algo(KernelEvalAlgo algo) const = 0;
 
+  // Initializes the interpolator.
+  Status initialize_interpolator();
+
+  // Initializes the interpolation kernel.
+  // Sets: kernel_params_.
+  Status initialize_kernel();
+
   // Initializes the fine grid dimension sizes and allocates the array.
-  // Sets: fine_dims_, fine_size_, fine_tensor_, fine_data_ and
-  //   options_.upsampling_factor.
+  // Sets: fine_dims_, fine_size_, fine_tensor_, fine_data_.
   // Requires: rank_, tol_, grid_dims_, grid_size_ and batch_size_.
   Status initialize_fine_grid();
 
@@ -351,6 +360,9 @@ class PlanBase {
   //  - These pointers are not owned by the plan.
   //  - Unused pointers are set to nullptr.
   FloatType* points_[3];
+
+  // Parameters of the interpolation kernel.
+  KernelArgs kernel_params_;
 
   // Pointer to the op kernel context.
   OpKernelContext* context_;
@@ -748,23 +760,6 @@ Status PlanBase<Device, FloatType>::set_default_options() {
   }
   this->options_.kernel_eval_algo = kernel_eval_algo;
 
-  // Kernel width.
-  int kernel_width = 0;
-  if (upsampling_factor == 2.0) {
-    // Special case for sigma == 2.0.
-    kernel_width = std::ceil(-log10(this->tol_ / FloatType(10.0)));
-  } else {
-    // General case.
-    kernel_width = std::ceil(
-        -log(this->tol_) /
-        (kPi<FloatType> * std::sqrt(1.0 - 1.0 / upsampling_factor)));
-  }
-  // Kernel width must be at least 2.
-  kernel_width = std::max(kernel_width, 2);
-  // Kernel width must no be larger than limit.
-  kernel_width = std::min(kernel_width, kMaxKernelWidth);
-  this->options_.kernel_width = kernel_width;
-
   return OkStatus();
 }
 
@@ -789,8 +784,8 @@ Status PlanBase<Device, FloatType>::initialize_fine_grid() {
     }
 
     // Make sure fine grid is at least as large as the kernel.
-    if (this->fine_dims_[d] < 2 * this->options_.kernel_width) {
-      this->fine_dims_[d] = 2 * this->options_.kernel_width;
+    if (this->fine_dims_[d] < 2 * this->options_.kernel_params_.w) {
+      this->fine_dims_[d] = 2 * this->options_.kernel_params_.w;
     }
 
     // Find the next smooth integer.
@@ -803,7 +798,7 @@ Status PlanBase<Device, FloatType>::initialize_fine_grid() {
       return errors::InvalidArgument(
           "Invalid grid dimension size: ", this->grid_dims_[d],
           ". Grid dimension must be even, larger than the kernel (",
-          2 * this->options_.kernel_width,
+          2 * this->options_.kernel_params_.w,
           ") and have no prime factors larger than 5.");
     }
 
@@ -834,6 +829,62 @@ Status PlanBase<Device, FloatType>::initialize_fine_grid() {
 
   return OkStatus();
 }
+
+
+template<typename Device, typename FloatType>
+Status PlanBase<Device, FloatType>::initialize_interpolator() {
+  TF_RETURN_IF_ERROR(this->initialize_kernel());
+  return OkStatus();
+};
+
+
+template<typename Device, typename FloatType>
+Status PlanBase<Device, FloatType>::initialize_kernel() {
+  // Kernel width.
+  int width = 0;
+  if (this->options_.upsampling_factor == 2.0) {
+    // Special case for sigma == 2.0.
+    width = std::ceil(-log10(this->tol_ / FloatType(10.0)));
+  } else {
+    // General case.
+    width = std::ceil(
+        -log(this->tol_) /
+        (kPi<FloatType> * std::sqrt(1.0 - 1.0 / upsampling_factor)));
+  }
+  // Kernel width must be at least 2.
+  width = std::max(width, 2);
+  // Kernel width must no be larger than limit.
+  width = std::min(width, kMaxKernelWidth);
+
+  // beta divided by width.
+  FloatType beta_over_width;
+  if (this->options_.upsampling_factor == 2.0) {
+    // Heuristic precomputed values for standard upsampling factors, with some
+    // adjustments for small widths.
+    if (width == 2) {
+      beta_over_width = 2.20;
+    } else if (width == 3) {
+      beta_over_width = 2.26;
+    } else if (width == 4) {
+      beta_over_width = 2.38;
+    } else {
+      // Good generic value.
+      beta_over_width = 2.30;
+    }
+  } else {
+    FloatType gamma = 0.97;
+    beta_over_width = gamma * kPi<FloatType> *
+                      (1.0 - 1.0 / (2 * this->options_.upsampling_factor));
+  }
+
+  // Set kernel parameters.
+  this->kernel_params_.w = width;
+  this->kernel_params_.hw = static_cast<FloatType>(width) / FloatType(2.0);
+  this->kernel_params_.c = 4.0 / static_cast<FloatType>(width * width);
+  this->kernel_params_.beta = static_cast<FloatType>(width) * beta_over_width;
+
+  return OkStatus();
+};
 
 
 template<typename Device, typename FloatType>

@@ -60,11 +60,6 @@ Status setup_spreader(int rank,
 static int get_transform_rank(int64_t n1, int64_t n2, int64_t n3);
 
 template<typename FloatType>
-Status check_spread_inputs(int64_t n1, int64_t n2, int64_t n3,
-                           int64_t num_points, FloatType *kx, FloatType *ky,
-                           FloatType *kz, SpreadParameters<FloatType> opts);
-
-template<typename FloatType>
 bool bin_sort_points(int64_t* sort_indices, int64_t n1, int64_t n2, int64_t n3,
                      int64_t num_points,  FloatType *kx, FloatType *ky,
                      FloatType *kz, SpreadParameters<FloatType> opts);
@@ -99,9 +94,6 @@ int spreadSorted(int64_t* sort_indices,int64_t N1, int64_t N2, int64_t N3,
 
 template<typename FloatType>
 static inline void set_kernel_args(FloatType *args, FloatType x, const SpreadParameters<FloatType>& opts);
-
-template<typename FloatType>
-static inline void evaluate_kernel_vector(FloatType *ker, FloatType *args, const SpreadParameters<FloatType>& opts, const int N);
 
 template<typename FloatType>
 static inline void eval_kernel_vec_Horner(FloatType *ker, const FloatType z, const int w, const SpreadParameters<FloatType> &opts);
@@ -228,6 +220,9 @@ Status Plan<CPUDevice, FloatType>::initialize(
   // Set default options.
   TF_RETURN_IF_ERROR(this->set_default_options());
 
+  // Initialize the interpolator.
+  TF_RETURN_IF_ERROR(this->initialize_interpolator());
+
   // Initialize the fine grid and related quantities.
   TF_RETURN_IF_ERROR(this->initialize_fine_grid());
 
@@ -291,11 +286,6 @@ Status Plan<CPUDevice, FloatType>::set_points(
   if (this->rank_ > 1) grid_size_1 = this->fine_dims_[1];
   int64_t grid_size_2 = 1;
   if (this->rank_ > 2) grid_size_2 = this->fine_dims_[2];
-
-  TF_RETURN_IF_ERROR(check_spread_inputs(
-      grid_size_0, grid_size_1, grid_size_2,
-      this->num_points_, points_x, points_y, points_z,
-      this->spread_params_));
 
   // Check that points are within bounds.
   if (this->options_.debugging().check_points_range()) {
@@ -742,7 +732,7 @@ Status setup_spreader(
   // write out default SpreadParameters<FloatType>
   spread_params.pirange = 1;             // user also should always set this
   spread_params.sort_points = SortPoints::AUTO;
-  spread_params.pad_kernel = 0;              // affects only evaluate_kernel_vector
+  spread_params.pad_kernel = 0;              // affects only eval_kernel
   spread_params.kerevalmeth = static_cast<int>(options.kernel_eval_algo) - 1;;
   spread_params.upsampling_factor = options.upsampling_factor;
   spread_params.num_threads = 0;            // all avail
@@ -753,23 +743,6 @@ Status setup_spreader(
   spread_params.verbosity = 0;               // 0:no debug output
   // heuristic num_threads above which switch OMP critical to atomic (add_wrapped...):
   spread_params.atomic_threshold = 10;   // R Blackwell's value
-
-  int ns = options.kernel_width;
-  spread_params.kernel_width = ns;
-
-  // setup for reference kernel eval (via formula): select beta width param...
-  // (even when kerevalmeth=1, this ker eval needed for FTs in onedim_*_kernel)
-  spread_params.kernel_half_width = (FloatType)ns / 2;   // constants to help (see below routines)
-  spread_params.kernel_c = 4.0 / (FloatType)(ns * ns);
-  FloatType beta_over_ns = 2.30;         // gives decent betas for default sigma=2.0
-  if (ns == 2) beta_over_ns = 2.20;  // some small-width tweaks...
-  if (ns == 3) beta_over_ns = 2.26;
-  if (ns == 4) beta_over_ns = 2.38;
-  if (options.upsampling_factor != 2.0) {          // again, override beta for custom sigma
-    FloatType gamma = 0.97;              // must match devel/gen_all_horner_C_code.m !
-    beta_over_ns = gamma * kPi<FloatType>*(1.0 - 1.0 / (2 * options.upsampling_factor));  // formula based on cutoff
-  }
-  spread_params.kernel_beta = beta_over_ns * (FloatType)ns;    // set the kernel beta parameter
 
   // Calculate scaling factor for spread/interp only mode.
   if (spread_params.spread_only)
@@ -785,26 +758,6 @@ Status setup_spreader(
     spread_params.atomic_threshold = options.num_threads_for_atomic_spread;
   if (options.max_spread_subproblem_size > 0)        // overrides
     spread_params.max_subproblem_size = options.max_spread_subproblem_size;
-
-  return OkStatus();
-}
-
-// Checks spreader inputs.
-// Split out by Melody Shih, Jun 2018. Finiteness chk Barnett 7/30/18.
-// Bypass FOLD_AND_RESCALE macro which has inevitable rounding err even nr +pi,
-// giving fake invalids well inside the [-3pi,3pi] domain, 4/9/21.
-// Equivalent to spreadcheck in original FINUFFT code.
-template<typename FloatType>
-Status check_spread_inputs(int64_t n1, int64_t n2, int64_t n3, int64_t num_points,
-                           FloatType *kx, FloatType *ky, FloatType *kz,
-                           SpreadParameters<FloatType> opts) {
-  // Check that cuboid is large enough for spreading.
-  int min_n = 2 * opts.kernel_width;
-  if (n1 < min_n || (n2 > 1 && n2 < min_n) || (n3 > 1 && n3 < min_n)) {
-    return errors::InvalidArgument(
-        "cuboid too small for spreading, got (", n1, ", ", n2, ", ", n3, ") ",
-        "but need at least ", min_n, " in each non-trivial dimension");
-  }
 
   return OkStatus();
 }
@@ -1239,8 +1192,7 @@ int interpSorted(int64_t* sort_indices,int64_t N1, int64_t N2, int64_t N3,
           set_kernel_args(kernel_args, x1, opts);
           if(ndims > 1)  set_kernel_args(kernel_args+ns, x2, opts);
           if(ndims > 2)  set_kernel_args(kernel_args+2*ns, x3, opts);
-
-          evaluate_kernel_vector(kernel_values, kernel_args, opts, ndims*ns);
+          eval_kernel(ndims * ns, kernel_args, kernel_values);
         } else {
           eval_kernel_vec_Horner(ker1,x1,ns,opts);
           if (ndims > 1) eval_kernel_vec_Horner(ker2,x2,ns,opts);
@@ -1293,40 +1245,54 @@ static inline void set_kernel_args(FloatType *args, FloatType x, const SpreadPar
     args[i] = x + (FloatType) i;
 }
 
+// Evaluates the "exponential of semi-circle" interpolation kernel on a vector
+// of points.
+//
+// Args:
+//   n: Length of the vector to be evaluated.
+//   x: Pointer to input points. Must have length n, or the smallest multiple
+//      of 4 larger than or equal to n if pad_for_simd is true.
+//   y: Pointer to output values. Must have length n, or the smallest multiple
+//      of 4 larger than or equal to n if pad_for_simd is true.
+//   args: Arguments for the interpolation kernel.
+//   pad_for_simd: If true, n is padded to a multiple of 4 to improve SIMD
+//     vectorization.
 template<typename FloatType>
-static inline void evaluate_kernel_vector(FloatType *ker, FloatType *args, const SpreadParameters<FloatType>& opts, const int N)
-/* Evaluate ES kernel for a vector of N arguments; by Ludvig af K.
-   If opts.pad_kernel true, args and ker must be allocated for Npad, and args is
-   written to (to pad to length Npad), only first N outputs are correct.
-   Barnett 4/24/18 option to pad to mult of 4 for better SIMD vectorization.
+static inline void eval_kernel(
+    const int n, const FloatType* x, FloatType *y,
+    const KernelArgs<FloatType>& args, bool pad_for_simd = false) {
+  FloatType b = args.beta;
+  FloatType c = args.c;
 
-   Obsolete (replaced by Horner), but keep around for experimentation since
-   works for arbitrary beta. Formula must match reference implementation. */
-{
-  FloatType b = opts.kernel_beta;
-  FloatType c = opts.kernel_c;
+  // If requested, pad length to multiple of 4. This helps some processors
+  // with vectorization.
+  int p = n;
+  if (pad_for_simd) {
+    // Conditional does not affect speed because it's always the same branch.
+    p = 4 * (1 + (n - 1) / 4);
+    for (int i = n; i < p; ++i) {
+      x[i] = 0.0;
+    }
+  }
 
   // Note (by Ludvig af K): Splitting kernel evaluation into two loops
   // seems to benefit auto-vectorization.
-  // gcc 5.4 vectorizes first loop; gcc 7.2 vectorizes both loops
-  int Npad = N;
-  if (opts.pad_kernel) {        // since always same branch, no speed hit
-    Npad = 4*(1+(N-1)/4);   // pad N to mult of 4; help i7 GCC, not xeon
-    for (int i=N;i<Npad;++i)    // pad with 1-3 zeros for safe eval
-      args[i] = 0.0;
-  }
 
   // Loop 1: Compute exponential arguments.
-  for (int i = 0; i < Npad; i++) {
-    ker[i] = b * sqrt(1.0 - c * args[i] * args[i]);
+  for (int i = 0; i < p; ++i) {
+    y[i] = b * sqrt(1.0 - c * x[i] * x[i]);
   }
+
   // Loop 2: Compute exponentials.
-  for (int i = 0; i < Npad; i++) {
-  	ker[i] = exp(ker[i]);
+  for (int i = 0; i < p; ++i) {
+  	y[i] = exp(y[i]);
   }
+
   // Separate check from arithmetic (Is this really needed? doesn't slow down)
-  for (int i = 0; i < N; i++) {
-    if (abs(args[i])>=opts.kernel_half_width) ker[i] = 0.0;
+  for (int i = 0; i < n; ++i) {
+    if (abs(x[i]) >= opts.kernel_half_width) {
+      y[i] = 0.0;
+    }
   }
 }
 
@@ -1544,7 +1510,7 @@ void spread_subproblem_1d(int64_t off1, int64_t size1,FloatType *du,int64_t M,
     if (x1>-ns2+1) x1=-ns2+1;   // ***
     if (opts.kerevalmeth==0) {          // faster Horner poly method
       set_kernel_args(kernel_args, x1, opts);
-      evaluate_kernel_vector(ker, kernel_args, opts, ns);
+      eval_kernel(ns, kernel_args, ker);
     } else
       eval_kernel_vec_Horner(ker,x1,ns,opts);
     int64_t j = i1-off1;    // offset rel to subgrid, starts the output indices
@@ -1590,7 +1556,7 @@ void spread_subproblem_2d(int64_t off1,int64_t off2,int64_t size1,int64_t size2,
     if (opts.kerevalmeth==0) {          // faster Horner poly method
       set_kernel_args(kernel_args, x1, opts);
       set_kernel_args(kernel_args+ns, x2, opts);
-      evaluate_kernel_vector(kernel_values, kernel_args, opts, 2*ns);
+      eval_kernel(2 * ns, kernel_args, kernel_values);
     } else {
       eval_kernel_vec_Horner(ker1,x1,ns,opts);
       eval_kernel_vec_Horner(ker2,x2,ns,opts);
@@ -1650,7 +1616,7 @@ void spread_subproblem_3d(int64_t off1,int64_t off2,int64_t off3,int64_t size1,
       set_kernel_args(kernel_args, x1, opts);
       set_kernel_args(kernel_args+ns, x2, opts);
       set_kernel_args(kernel_args+2*ns, x3, opts);
-      evaluate_kernel_vector(kernel_values, kernel_args, opts, 3*ns);
+      eval_kernel(3 * ns, kernel_args, kernel_values);
     } else {
       eval_kernel_vec_Horner(ker1,x1,ns,opts);
       eval_kernel_vec_Horner(ker2,x2,ns,opts);
